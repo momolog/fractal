@@ -1,0 +1,10 @@
+[package]
+name = "fractal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dashu-float = "0.6.1"
+rayon = "1.12.0"
+softbuffer = "0.4.8"
+winit = "0.30.13"
