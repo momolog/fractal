@@ -22,7 +22,19 @@ im = 0.13182590420531197049313205638514067897295227932892.*
   pixels are still undecided.
 - **Boundary shading** from a distance estimate keeps filaments crisp instead of noisy.
 
-## Run
+## Download
+
+A ready-built binary for Apple Silicon Macs (macOS 11 or newer) is on the
+[releases page](https://github.com/momolog/fractal/releases/latest). It is not signed with an
+Apple developer certificate, so macOS blocks it the first time. After unpacking, either
+right-click it and choose *Open*, or run:
+
+```
+xattr -d com.apple.quarantine fractal
+./fractal
+```
+
+## Build and run
 
 Needs Rust ([mise](https://mise.jdx.dev) installs the pinned version from `mise.toml`):
 
