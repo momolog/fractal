@@ -2,6 +2,7 @@
 name = "fractal"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 dashu-float = "0.6.1"

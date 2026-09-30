@@ -55,3 +55,7 @@ cargo run --release
 | `P` | Print the current location |
 | `R` | Reset |
 | `Esc` | Quit |
+
+## License
+
+MIT, see [LICENSE](LICENSE).
