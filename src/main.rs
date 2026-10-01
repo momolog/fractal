@@ -11,6 +11,8 @@
 //! · H = full Retina resolution (slower) · F = full screen · Esc = quit
 
 use dashu_float::FBig;
+use fearless_simd::{dispatch, f64x4, mask64x4, prelude::*, Level};
+use fearless_simd_macros::simd;
 use rayon::prelude::*;
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
@@ -257,6 +259,9 @@ impl Jumps {
 }
 
 /// Iterate the point at offset (dcr, dci) from the reference, `scale` units per pixel.
+/// The renderer runs `iterate_many`, which does the same for several pixels at once; this
+/// one-pixel version is the reference it is tested against.
+#[cfg(test)]
 fn iterate(orbit: &[(f64, f64)], jumps: &Jumps, dcr: f64, dci: f64, max_iter: usize, scale: f64) -> Fate {
     let last = orbit.len() - 1;
     let dc = C { re: dcr, im: dci };
@@ -322,6 +327,141 @@ fn iterate(orbit: &[(f64, f64)], jumps: &Jumps, dcr: f64, dci: f64, max_iter: us
     Fate::Unknown
 }
 
+/// Pixels iterated side by side, one per SIMD lane.
+const LANES: usize = 4;
+/// Marks a lane with no pixel in it.
+const IDLE: usize = usize::MAX;
+
+/// The state of `iterate`, for `LANES` pixels at once.
+#[derive(Default)]
+struct Lanes {
+    pixel: [usize; LANES],
+    dcr: [f64; LANES],
+    dci: [f64; LANES],
+    dr: [f64; LANES],
+    di: [f64; LANES],
+    fr: [f64; LANES],
+    fi: [f64; LANES],
+    pr: [f64; LANES],
+    pi: [f64; LANES],
+    qr: [f64; LANES],
+    qi: [f64; LANES],
+    m: [usize; LANES],
+    n: [usize; LANES],
+}
+
+impl Lanes {
+    /// Put the next pixel of `dc` into lane `l`, or leave it idle if none are left.
+    fn start(&mut self, l: usize, next: &mut usize, dc: &[(f64, f64)]) {
+        self.pixel[l] = if *next < dc.len() { *next } else { IDLE };
+        let (dcr, dci) = dc.get(*next).copied().unwrap_or_default();
+        *next += 1;
+        (self.dcr[l], self.dci[l]) = (dcr, dci);
+        (self.dr[l], self.di[l], self.fr[l], self.fi[l], self.pr[l], self.pi[l]) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        (self.qr[l], self.qi[l]) = (1.0, 0.0);
+        (self.m[l], self.n[l]) = (0, 0);
+    }
+}
+
+/// `iterate` for every offset in `dc`, `LANES` pixels at a time: the plain steps run in SIMD,
+/// jumps, rebasing and escape stay per pixel. A lane takes the next pixel as soon as its
+/// own is decided, so lanes do not wait on each other. Gives the same results as `iterate`.
+#[simd]
+fn iterate_many<S: Simd>(
+    simd: S,
+    orbit: &[(f64, f64)],
+    jumps: &Jumps,
+    dc: &[(f64, f64)],
+    max_iter: usize,
+    scale: f64,
+    out: &mut [Fate],
+) {
+    let last = orbit.len() - 1;
+    let v = |a: [f64; LANES]| -> f64x4<S> { a.simd_into(simd) };
+    let (two, scale_v) = (f64x4::splat(simd, 2.0), f64x4::splat(simd, scale));
+    let mut s = Lanes::default();
+    let mut next = 0;
+    for l in 0..LANES {
+        s.start(l, &mut next, dc);
+    }
+    while s.pixel.iter().any(|&p| p != IDLE) {
+        // Per pixel: take a jump if one is valid, otherwise queue a plain step.
+        let (mut step, mut later) = ([0i64; LANES], [0i64; LANES]);
+        let (mut zr, mut zi) = ([0.0; LANES], [0.0; LANES]);
+        for l in 0..LANES {
+            if s.pixel[l] == IDLE {
+                continue;
+            }
+            let (m, n) = (s.m[l], s.n[l]);
+            let d2 = s.dr[l] * s.dr[l] + s.di[l] * s.di[l];
+            let jump = if m > 0 { jumps.find(m, d2, max_iter - n) } else { None };
+            if let Some((jump, len)) = jump {
+                let d = jump.a.mul(C { re: s.dr[l], im: s.di[l] }).add(jump.b.mul(C { re: s.dcr[l], im: s.dci[l] }));
+                let p = jump.a.mul(C { re: s.pr[l], im: s.pi[l] }).add(C { re: jump.b.re * scale, im: jump.b.im * scale });
+                let q = jump.a.mul(C { re: s.qr[l], im: s.qi[l] });
+                (s.dr[l], s.di[l], s.pr[l], s.pi[l], s.qr[l], s.qi[l]) = (d.re, d.im, p.re, p.im, q.re, q.im);
+                s.m[l] += len;
+                s.n[l] += len;
+            } else {
+                step[l] = -1;
+                later[l] = if n > 0 { -1 } else { 0 };
+                (zr[l], zi[l]) = orbit[m];
+                s.m[l] += 1;
+                s.n[l] += 1;
+            }
+        }
+
+        // The plain steps, all lanes at once; lanes that jumped keep their values.
+        let step: mask64x4<S> = step.simd_into(simd);
+        let later: mask64x4<S> = later.simd_into(simd);
+        let (fr, fi, pr, pi, qr, qi) = (v(s.fr), v(s.fi), v(s.pr), v(s.pi), v(s.qr), v(s.qi));
+        let (dr, di, zr, zi) = (v(s.dr), v(s.di), v(zr), v(zi));
+        let npr = two * (fr * pr - fi * pi) + scale_v;
+        let npi = two * (fr * pi + fi * pr);
+        let nqr = later.select(two * (fr * qr - fi * qi), qr);
+        let nqi = later.select(two * (fr * qi + fi * qr), qi);
+        let ndr = two * (zr * dr - zi * di) + (dr * dr - di * di) + v(s.dcr);
+        let ndi = two * (zr * di + zi * dr) + two * dr * di + v(s.dci);
+        s.pr = step.select(npr, pr).into();
+        s.pi = step.select(npi, pi).into();
+        s.qr = step.select(nqr, qr).into();
+        s.qi = step.select(nqi, qi).into();
+        s.dr = step.select(ndr, dr).into();
+        s.di = step.select(ndi, di).into();
+
+        // Per pixel: decide, rebase, or move on to the next pixel.
+        for l in 0..LANES {
+            if s.pixel[l] == IDLE {
+                continue;
+            }
+            let (qr, qi) = (s.qr[l], s.qi[l]);
+            let fate = if qr * qr + qi * qi < 1e-12 {
+                Some(Fate::Inside)
+            } else {
+                let (zr, zi) = orbit[s.m[l]];
+                let (dr, di) = (s.dr[l], s.di[l]);
+                let (fr, fi) = (zr + dr, zi + di);
+                (s.fr[l], s.fi[l]) = (fr, fi);
+                let mag = fr * fr + fi * fi;
+                if mag > BAILOUT {
+                    let (pr, pi) = (s.pr[l], s.pi[l]);
+                    let de = mag.sqrt() * mag.ln() / (pr * pr + pi * pi).sqrt();
+                    Some(Fate::Escaped { n: s.n[l] - 1, mag, de })
+                } else {
+                    if mag < dr * dr + di * di || s.m[l] == last {
+                        (s.dr[l], s.di[l], s.m[l]) = (fr, fi, 0);
+                    }
+                    (s.n[l] >= max_iter).then_some(Fate::Unknown)
+                }
+            };
+            if let Some(fate) = fate {
+                out[s.pixel[l]] = fate;
+                s.start(l, &mut next, dc);
+            }
+        }
+    }
+}
+
 fn colour(fate: Fate) -> u32 {
     let Fate::Escaped { n, mag, de } = fate else { return 0 };
     // Smooth (fractional) iteration count, so colour bands blend instead of stepping.
@@ -360,6 +500,7 @@ fn render(view: View, generation: u64, latest: Arc<AtomicU64>, out: Sender<Frame
     let mut max_iter = view.max_iter();
     let mut steps: &[usize] = &[4, 1];
     let mut previous_undecided = 1.0;
+    let level = Level::new();
 
     loop {
         let Some(orbit) = reference_orbit(&view, max_iter, &cancelled) else { return };
@@ -373,11 +514,12 @@ fn render(view: View, generation: u64, latest: Arc<AtomicU64>, out: Sender<Frame
                 if cancelled() {
                     return false;
                 }
-                for (col, px) in line.iter_mut().enumerate() {
-                    let x = (col * step) as f64 + step as f64 / 2.0;
-                    let y = (row * step) as f64 + step as f64 / 2.0;
-                    let (dcr, dci) = view.offset(x, y);
-                    let fate = iterate(&orbit, &jumps, dcr, dci, max_iter, view.scale * step as f64);
+                let y = (row * step) as f64 + step as f64 / 2.0;
+                let dc: Vec<_> = (0..w).map(|col| view.offset((col * step) as f64 + step as f64 / 2.0, y)).collect();
+                let mut fates = vec![Fate::Unknown; w];
+                let scale = view.scale * step as f64;
+                dispatch!(level, simd => iterate_many(simd, &orbit, &jumps, &dc, max_iter, scale, &mut fates));
+                for (px, fate) in line.iter_mut().zip(fates) {
                     if fate == Fate::Unknown {
                         unknown.fetch_add(1, Ordering::Relaxed);
                     }
@@ -872,6 +1014,12 @@ mod jump_tests {
     /// The classic deep-zoom location in the seahorse valley.
     const SEAHORSE: (&str, &str) = ("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139");
 
+    /// The period-8007 copy of the set shown in the README.
+    pub(super) const MINIBROT: (&str, &str) = (
+        "-0.74364388703715870475219150611477977821525620794818",
+        "0.13182590420531197049313205638514067897295227932892",
+    );
+
     fn view(re: &str, im: &str, scale: f64) -> View {
         let prec = precision_for(scale);
         let parse = |s: &str| {
@@ -879,6 +1027,28 @@ mod jump_tests {
             dashu_float::DBig::from_str(s).unwrap().with_base_and_precision::<2>(prec).value().with_rounding()
         };
         View { re: parse(re), im: parse(im), scale, width: 480, height: 320, iter_factor: 1.0, iter_floor: 0 }
+    }
+
+    #[test]
+    fn lanes_agree_with_iterate() {
+        for v in [
+            view("-0.6", "0", 3.2 / 480.0),
+            view(SEAHORSE.0, SEAHORSE.1, 1e-14 / 480.0),
+            view(MINIBROT.0, MINIBROT.1, START_SCALE / 5e28 * 2.0),
+        ] {
+            let max_iter = 20_000;
+            let orbit = reference_orbit(&v, max_iter, &|| false).unwrap();
+            let dc_max = (v.width as f64).hypot(v.height as f64) / 2.0 * v.scale;
+            let jumps = Jumps::build(&orbit, dc_max, JUMP_EPS);
+            let dc: Vec<_> = (0..v.width * v.height)
+                .map(|i| v.offset((i % v.width) as f64 + 0.5, (i / v.width) as f64 + 0.5))
+                .collect();
+            let mut lanes = vec![Fate::Unknown; dc.len()];
+            dispatch!(Level::new(), simd => iterate_many(simd, &orbit, &jumps, &dc, max_iter, v.scale, &mut lanes));
+            for (i, &(dcr, dci)) in dc.iter().enumerate() {
+                assert_eq!(lanes[i], iterate(&orbit, &jumps, dcr, dci, max_iter, v.scale), "pixel {i}");
+            }
+        }
     }
 
     #[test]
@@ -900,3 +1070,69 @@ mod jump_tests {
     }
 }
 
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// Best of three runs, in seconds.
+    fn time(render: impl Fn() -> Vec<u32>) -> f64 {
+        (0..3)
+            .map(|_| {
+                let t = Instant::now();
+                std::hint::black_box(render());
+                t.elapsed().as_secs_f64()
+            })
+            .fold(f64::MAX, f64::min)
+    }
+
+    /// Time full 960×640 renders at a few depths, one pixel at a time and in SIMD lanes:
+    /// `cargo test --release bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn render_speed() {
+        let parse = |s: &str, prec| {
+            use std::str::FromStr;
+            dashu_float::DBig::from_str(s).unwrap().with_base_and_precision::<2>(prec).value().with_rounding()
+        };
+        let seahorse = ("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139");
+        for (name, re, im, scale) in [
+            ("home", "-0.6", "0", 3.2 / WIDTH as f64),
+            ("1e-6 seahorse", seahorse.0, seahorse.1, 1e-6 / WIDTH as f64),
+            ("1e-14 seahorse", seahorse.0, seahorse.1, 1e-14 / WIDTH as f64),
+            ("5e28 minibrot", jump_tests::MINIBROT.0, jump_tests::MINIBROT.1, START_SCALE / 5e28),
+        ] {
+            let prec = precision_for(scale);
+            let view = View { re: parse(re, prec), im: parse(im, prec), scale, width: WIDTH, height: HEIGHT, iter_factor: 1.0, iter_floor: 0 };
+            let max_iter = view.max_iter() * 4;
+            let orbit = reference_orbit(&view, max_iter, &|| false).unwrap();
+            let dc_max = (view.width as f64).hypot(view.height as f64) / 2.0 * view.scale;
+            let jumps = Jumps::build(&orbit, dc_max, JUMP_EPS);
+            let level = Level::new();
+            let lanes = time(|| {
+                (0..HEIGHT)
+                    .into_par_iter()
+                    .flat_map_iter(|row| {
+                        let dc: Vec<_> = (0..WIDTH).map(|col| view.offset(col as f64 + 0.5, row as f64 + 0.5)).collect();
+                        let mut fates = vec![Fate::Unknown; WIDTH];
+                        dispatch!(level, simd => iterate_many(simd, &orbit, &jumps, &dc, max_iter, view.scale, &mut fates));
+                        fates.into_iter().map(colour)
+                    })
+                    .collect()
+            });
+            let scalar = time(|| {
+                (0..HEIGHT)
+                    .into_par_iter()
+                    .flat_map_iter(|row| {
+                        let (view, orbit, jumps) = (&view, &orbit, &jumps);
+                        (0..WIDTH).map(move |col| {
+                            let (dcr, dci) = view.offset(col as f64 + 0.5, row as f64 + 0.5);
+                            colour(iterate(orbit, jumps, dcr, dci, max_iter, view.scale))
+                        })
+                    })
+                    .collect()
+            });
+            eprintln!("{name:>16}: scalar {:7.1} ms · lanes {:7.1} ms · {:.2}× ({max_iter} iterations)", scalar * 1e3, lanes * 1e3, scalar / lanes);
+        }
+    }
+}
