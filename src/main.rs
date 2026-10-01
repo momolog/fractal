@@ -332,6 +332,31 @@ const LANES: usize = 4;
 /// Marks a lane with no pixel in it.
 const IDLE: usize = usize::MAX;
 
+/// How far one pixel's orbit has got, so a raised iteration limit can carry on from there
+/// instead of starting over.
+#[derive(Clone, Copy, Debug)]
+struct Pixel {
+    dcr: f64,
+    dci: f64,
+    dr: f64,
+    di: f64,
+    fr: f64,
+    fi: f64,
+    pr: f64,
+    pi: f64,
+    qr: f64,
+    qi: f64,
+    m: usize,
+    n: usize,
+}
+
+impl Pixel {
+    /// A pixel at offset (dcr, dci) from the reference, not iterated yet.
+    fn new((dcr, dci): (f64, f64)) -> Self {
+        Pixel { dcr, dci, dr: 0.0, di: 0.0, fr: 0.0, fi: 0.0, pr: 0.0, pi: 0.0, qr: 1.0, qi: 0.0, m: 0, n: 0 }
+    }
+}
+
 /// The state of `iterate`, for `LANES` pixels at once.
 #[derive(Default)]
 struct Lanes {
@@ -351,27 +376,44 @@ struct Lanes {
 }
 
 impl Lanes {
-    /// Put the next pixel of `dc` into lane `l`, or leave it idle if none are left.
-    fn start(&mut self, l: usize, next: &mut usize, dc: &[(f64, f64)]) {
-        self.pixel[l] = if *next < dc.len() { *next } else { IDLE };
-        let (dcr, dci) = dc.get(*next).copied().unwrap_or_default();
+    /// Put the next of `pixels` into lane `l`, or leave it idle if none are left.
+    fn start(&mut self, l: usize, next: &mut usize, pixels: &[Pixel]) {
+        self.pixel[l] = if *next < pixels.len() { *next } else { IDLE };
+        let p = pixels.get(*next).copied().unwrap_or(Pixel::new((0.0, 0.0)));
         *next += 1;
-        (self.dcr[l], self.dci[l]) = (dcr, dci);
-        (self.dr[l], self.di[l], self.fr[l], self.fi[l], self.pr[l], self.pi[l]) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        (self.qr[l], self.qi[l]) = (1.0, 0.0);
-        (self.m[l], self.n[l]) = (0, 0);
+        (self.dcr[l], self.dci[l], self.dr[l], self.di[l], self.fr[l], self.fi[l]) = (p.dcr, p.dci, p.dr, p.di, p.fr, p.fi);
+        (self.pr[l], self.pi[l], self.qr[l], self.qi[l], self.m[l], self.n[l]) = (p.pr, p.pi, p.qr, p.qi, p.m, p.n);
+    }
+
+    /// The pixel in lane `l`, as far as it has got.
+    fn save(&self, l: usize) -> Pixel {
+        Pixel {
+            dcr: self.dcr[l],
+            dci: self.dci[l],
+            dr: self.dr[l],
+            di: self.di[l],
+            fr: self.fr[l],
+            fi: self.fi[l],
+            pr: self.pr[l],
+            pi: self.pi[l],
+            qr: self.qr[l],
+            qi: self.qi[l],
+            m: self.m[l],
+            n: self.n[l],
+        }
     }
 }
 
-/// `iterate` for every offset in `dc`, `LANES` pixels at a time: the plain steps run in SIMD,
+/// `iterate` for every one of `pixels`, `LANES` at a time: the plain steps run in SIMD,
 /// jumps, rebasing and escape stay per pixel. A lane takes the next pixel as soon as its
 /// own is decided, so lanes do not wait on each other. Gives the same results as `iterate`.
+/// Pixels left undecided at `max_iter` are written back as far as they got, to continue.
 #[simd]
 fn iterate_many<S: Simd>(
     simd: S,
     orbit: &[(f64, f64)],
     jumps: &Jumps,
-    dc: &[(f64, f64)],
+    pixels: &mut [Pixel],
     max_iter: usize,
     scale: f64,
     out: &mut [Fate],
@@ -382,7 +424,7 @@ fn iterate_many<S: Simd>(
     let mut s = Lanes::default();
     let mut next = 0;
     for l in 0..LANES {
-        s.start(l, &mut next, dc);
+        s.start(l, &mut next, pixels);
     }
     while s.pixel.iter().any(|&p| p != IDLE) {
         // Per pixel: take a jump if one is valid, otherwise queue a plain step.
@@ -448,15 +490,21 @@ fn iterate_many<S: Simd>(
                     let de = mag.sqrt() * mag.ln() / (pr * pr + pi * pi).sqrt();
                     Some(Fate::Escaped { n: s.n[l] - 1, mag, de })
                 } else {
-                    if mag < dr * dr + di * di || s.m[l] == last {
+                    // At the limit the reference orbit ends only because the limit does: leave
+                    // the pixel where it is, so a longer orbit can carry it on.
+                    let limit = s.n[l] >= max_iter;
+                    if mag < dr * dr + di * di || (s.m[l] == last && !limit) {
                         (s.dr[l], s.di[l], s.m[l]) = (fr, fi, 0);
                     }
-                    (s.n[l] >= max_iter).then_some(Fate::Unknown)
+                    limit.then_some(Fate::Unknown)
                 }
             };
             if let Some(fate) = fate {
+                if fate == Fate::Unknown {
+                    pixels[s.pixel[l]] = s.save(l);
+                }
                 out[s.pixel[l]] = fate;
-                s.start(l, &mut next, dc);
+                s.start(l, &mut next, pixels);
             }
         }
     }
@@ -492,80 +540,117 @@ struct Frame {
 const UNKNOWN_LIMIT: f64 = 0.002;
 const ITER_CAP: usize = 2_000_000;
 
+/// The pixels of one render pass, `step` screen pixels apart.
+struct Pass {
+    width: usize,
+    step: usize,
+    fates: Vec<Fate>,
+    /// Indices into `fates` of the undecided pixels, and how far each got.
+    undecided: Vec<usize>,
+    states: Vec<Pixel>,
+}
+
+/// Every `step`-th pixel of `view`, iterated up to `max_iter`. None if cancelled.
+fn first_pass(view: &View, orbit: &[(f64, f64)], jumps: &Jumps, level: Level, max_iter: usize, step: usize, cancelled: &(dyn Fn() -> bool + Sync)) -> Option<Pass> {
+    let (w, h) = (view.width.div_ceil(step), view.height.div_ceil(step));
+    let scale = view.scale * step as f64;
+    let rows: Vec<(Vec<Fate>, Vec<Pixel>)> = (0..h)
+        .into_par_iter()
+        .map(|row| {
+            if cancelled() {
+                return None;
+            }
+            let y = (row * step) as f64 + step as f64 / 2.0;
+            let mut pixels: Vec<Pixel> =
+                (0..w).map(|col| Pixel::new(view.offset((col * step) as f64 + step as f64 / 2.0, y))).collect();
+            let mut fates = vec![Fate::Unknown; w];
+            dispatch!(level, simd => iterate_many(simd, orbit, jumps, &mut pixels, max_iter, scale, &mut fates));
+            Some((fates, pixels))
+        })
+        .collect::<Option<_>>()?;
+    let mut pass = Pass { width: w, step, fates: Vec::with_capacity(w * h), undecided: Vec::new(), states: Vec::new() };
+    for (fates, pixels) in rows {
+        for (fate, pixel) in fates.into_iter().zip(pixels) {
+            if fate == Fate::Unknown {
+                pass.undecided.push(pass.fates.len());
+                pass.states.push(pixel);
+            }
+            pass.fates.push(fate);
+        }
+    }
+    Some(pass)
+}
+
+/// Continue the undecided pixels of `pass` up to `max_iter`. False if cancelled.
+fn continue_pass(pass: &mut Pass, view: &View, orbit: &[(f64, f64)], jumps: &Jumps, level: Level, max_iter: usize, cancelled: &(dyn Fn() -> bool + Sync)) -> bool {
+    let scale = view.scale * pass.step as f64;
+    let mut fates = vec![Fate::Unknown; pass.states.len()];
+    let complete = pass.states.par_chunks_mut(64).zip(fates.par_chunks_mut(64)).all(|(pixels, fates)| {
+        if cancelled() {
+            return false;
+        }
+        dispatch!(level, simd => iterate_many(simd, orbit, jumps, pixels, max_iter, scale, fates));
+        true
+    });
+    if !complete {
+        return false;
+    }
+    let (mut undecided, mut states) = (Vec::new(), Vec::new());
+    for ((i, state), fate) in pass.undecided.iter().zip(&pass.states).zip(fates) {
+        pass.fates[*i] = fate;
+        if fate == Fate::Unknown {
+            undecided.push(*i);
+            states.push(*state);
+        }
+    }
+    (pass.undecided, pass.states) = (undecided, states);
+    true
+}
+
 /// Render `view` into frames: a coarse preview first, then full resolution. When too
-/// many pixels are left undecided, raise the iteration limit and render again.
+/// many pixels are left undecided, raise the iteration limit and carry on with those.
 fn render(view: View, generation: u64, latest: Arc<AtomicU64>, out: Sender<Frame>, wake: impl Fn()) {
     let started = Instant::now();
     let cancelled = || latest.load(Ordering::Relaxed) != generation;
     let mut max_iter = view.max_iter();
-    let mut steps: &[usize] = &[4, 1];
-    let mut previous_undecided = 1.0;
     let level = Level::new();
+    let dc_max = (view.width as f64).hypot(view.height as f64) / 2.0 * view.scale;
+    let Some(mut orbit) = reference_orbit(&view, max_iter, &cancelled) else { return };
+    let mut jumps = Jumps::build(&orbit, dc_max, JUMP_EPS);
 
+    let send = |pass: &Pass, max_iter: usize, final_pass: bool| {
+        let (width, step) = (view.width, pass.step);
+        let colours: Vec<u32> = pass.fates.iter().map(|&f| colour(f)).collect();
+        let pixels = (0..width * view.height).map(|i| colours[(i / width / step) * pass.width + (i % width) / step]).collect();
+        let frame = Frame { generation, pixels, width, height: view.height, final_pass, max_iter, seconds: started.elapsed().as_secs_f64() };
+        let sent = out.send(frame).is_ok();
+        wake();
+        sent
+    };
+
+    let Some(preview) = first_pass(&view, &orbit, &jumps, level, max_iter, 4, &cancelled) else { return };
+    if !send(&preview, max_iter, false) {
+        return;
+    }
+    let Some(mut pass) = first_pass(&view, &orbit, &jumps, level, max_iter, 1, &cancelled) else { return };
+    let mut previous_undecided = 1.0;
     loop {
-        let Some(orbit) = reference_orbit(&view, max_iter, &cancelled) else { return };
-        let dc_max = (view.width as f64).hypot(view.height as f64) / 2.0 * view.scale;
-        let jumps = Jumps::build(&orbit, dc_max, JUMP_EPS);
-        for &step in steps {
-            let (w, h) = (view.width.div_ceil(step), view.height.div_ceil(step));
-            let mut small = vec![0u32; w * h];
-            let unknown = AtomicU64::new(0);
-            let complete = small.par_chunks_mut(w).enumerate().all(|(row, line)| {
-                if cancelled() {
-                    return false;
-                }
-                let y = (row * step) as f64 + step as f64 / 2.0;
-                let dc: Vec<_> = (0..w).map(|col| view.offset((col * step) as f64 + step as f64 / 2.0, y)).collect();
-                let mut fates = vec![Fate::Unknown; w];
-                let scale = view.scale * step as f64;
-                dispatch!(level, simd => iterate_many(simd, &orbit, &jumps, &dc, max_iter, scale, &mut fates));
-                for (px, fate) in line.iter_mut().zip(fates) {
-                    if fate == Fate::Unknown {
-                        unknown.fetch_add(1, Ordering::Relaxed);
-                    }
-                    *px = colour(fate);
-                }
-                true
-            });
-            if !complete {
-                return;
-            }
-            let undecided = unknown.load(Ordering::Relaxed) as f64 / (w * h) as f64;
-            // Raise only while doubling still settles a good share of the undecided pixels;
-            // near cusps some stay undecided for any practical limit.
-            let raise = step == 1
-                && undecided > UNKNOWN_LIMIT
-                && undecided < 0.7 * previous_undecided
-                && max_iter < ITER_CAP;
-            if step == 1 {
-                previous_undecided = undecided;
-            }
-
-            let width = view.width;
-            let mut pixels = vec![0u32; width * view.height];
-            for (i, px) in pixels.iter_mut().enumerate() {
-                *px = small[(i / width / step) * w + (i % width) / step];
-            }
-            let frame = Frame {
-                generation,
-                pixels,
-                width,
-                height: view.height,
-                final_pass: step == 1 && !raise,
-                max_iter,
-                seconds: started.elapsed().as_secs_f64(),
-            };
-            if out.send(frame).is_err() {
-                return;
-            }
-            wake();
-            if raise {
-                max_iter = (max_iter * 2).min(ITER_CAP);
-                steps = &[1];
-                break;
-            } else if step == 1 {
-                return;
-            }
+        let undecided = pass.undecided.len() as f64 / pass.fates.len() as f64;
+        // Raise while most of the view is undecided (the limit is below the period of what
+        // fills it), then only while doubling still settles a good share of the undecided
+        // pixels: near cusps some stay undecided for any practical limit.
+        let settling = undecided > 0.5 || undecided < 0.7 * previous_undecided;
+        let raise = undecided > UNKNOWN_LIMIT && settling && max_iter < ITER_CAP;
+        previous_undecided = undecided;
+        if !send(&pass, max_iter, !raise) || !raise {
+            return;
+        }
+        max_iter = (max_iter * 2).min(ITER_CAP);
+        let Some(longer) = reference_orbit(&view, max_iter, &cancelled) else { return };
+        orbit = longer;
+        jumps = Jumps::build(&orbit, dc_max, JUMP_EPS);
+        if !continue_pass(&mut pass, &view, &orbit, &jumps, level, max_iter, &cancelled) {
+            return;
         }
     }
 }
@@ -1044,11 +1129,54 @@ mod jump_tests {
                 .map(|i| v.offset((i % v.width) as f64 + 0.5, (i / v.width) as f64 + 0.5))
                 .collect();
             let mut lanes = vec![Fate::Unknown; dc.len()];
-            dispatch!(Level::new(), simd => iterate_many(simd, &orbit, &jumps, &dc, max_iter, v.scale, &mut lanes));
+            let mut pixels: Vec<Pixel> = dc.iter().map(|&d| Pixel::new(d)).collect();
+            dispatch!(Level::new(), simd => iterate_many(simd, &orbit, &jumps, &mut pixels, max_iter, v.scale, &mut lanes));
             for (i, &(dcr, dci)) in dc.iter().enumerate() {
                 assert_eq!(lanes[i], iterate(&orbit, &jumps, dcr, dci, max_iter, v.scale), "pixel {i}");
             }
         }
+    }
+
+    #[test]
+    fn continuing_matches_starting_over() {
+        for (v, low, high) in [
+            (view(SEAHORSE.0, SEAHORSE.1, 1e-6 / 480.0), 2_000, 16_000),
+            (view(MINIBROT.0, MINIBROT.1, START_SCALE / 5e31 * 2.0), 8_224, 16_448),
+        ] {
+            continues(&v, low, high);
+        }
+    }
+
+    fn continues(v: &View, low: usize, high: usize) {
+        let dc_max = (v.width as f64).hypot(v.height as f64) / 2.0 * v.scale;
+        let setup = |max_iter| {
+            let orbit = reference_orbit(v, max_iter, &|| false).unwrap();
+            let jumps = Jumps::build(&orbit, dc_max, JUMP_EPS);
+            (orbit, jumps)
+        };
+        let (orbit, jumps) = setup(low);
+        let mut resumed = first_pass(v, &orbit, &jumps, Level::new(), low, 1, &|| false).unwrap();
+        assert!(!resumed.undecided.is_empty());
+        let (orbit, jumps) = setup(high);
+        assert!(continue_pass(&mut resumed, v, &orbit, &jumps, Level::new(), high, &|| false));
+        let fresh = first_pass(v, &orbit, &jumps, Level::new(), high, 1, &|| false).unwrap();
+        let class = |f: &Fate| std::mem::discriminant(f);
+        let differ = resumed.fates.iter().zip(&fresh.fates).filter(|(a, b)| class(a) != class(b)).count();
+        assert!(differ * 1000 < fresh.fates.len(), "{differ} pixels differ");
+        assert_eq!(resumed.undecided.len(), fresh.undecided.len());
+    }
+
+    #[test]
+    fn raises_the_limit_when_nothing_is_decided() {
+        // The default limit here is below the period of the copy filling the view, so the
+        // first full pass decides nothing.
+        let v = view(MINIBROT.0, MINIBROT.1, START_SCALE / 5e28 * 2.0);
+        let (tx, rx) = channel();
+        render(v, 1, Arc::new(AtomicU64::new(1)), tx, || {});
+        let last = rx.try_iter().last().unwrap();
+        assert!(last.final_pass);
+        let coloured = last.pixels.iter().filter(|&&p| p != 0).count();
+        assert!(coloured * 2 > last.pixels.len(), "only {coloured} of {} pixels coloured", last.pixels.len());
     }
 
     #[test]
@@ -1113,9 +1241,9 @@ mod bench {
                 (0..HEIGHT)
                     .into_par_iter()
                     .flat_map_iter(|row| {
-                        let dc: Vec<_> = (0..WIDTH).map(|col| view.offset(col as f64 + 0.5, row as f64 + 0.5)).collect();
+                        let mut pixels: Vec<Pixel> = (0..WIDTH).map(|col| Pixel::new(view.offset(col as f64 + 0.5, row as f64 + 0.5))).collect();
                         let mut fates = vec![Fate::Unknown; WIDTH];
-                        dispatch!(level, simd => iterate_many(simd, &orbit, &jumps, &dc, max_iter, view.scale, &mut fates));
+                        dispatch!(level, simd => iterate_many(simd, &orbit, &jumps, &mut pixels, max_iter, view.scale, &mut fates));
                         fates.into_iter().map(colour)
                     })
                     .collect()
@@ -1133,6 +1261,156 @@ mod bench {
                     .collect()
             });
             eprintln!("{name:>16}: scalar {:7.1} ms · lanes {:7.1} ms · {:.2}× ({max_iter} iterations)", scalar * 1e3, lanes * 1e3, scalar / lanes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod diag {
+    use super::*;
+
+    /// `iterate`, counting plain steps and jumps.
+    fn counted(orbit: &[(f64, f64)], jumps: &Jumps, dcr: f64, dci: f64, max_iter: usize, scale: f64) -> (Fate, usize, usize) {
+        let last = orbit.len() - 1;
+        let dc = C { re: dcr, im: dci };
+        let (mut dr, mut di, mut fr, mut fi, mut pr, mut pi, mut qr, mut qi) = (0.0, 0.0, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 1.0f64, 0.0f64);
+        let (mut m, mut n, mut steps, mut js) = (0, 0, 0, 0);
+        while n < max_iter {
+            let jump = if m > 0 { jumps.find(m, dr * dr + di * di, max_iter - n) } else { None };
+            if let Some((jump, len)) = jump {
+                let d = jump.a.mul(C { re: dr, im: di }).add(jump.b.mul(dc));
+                let p = jump.a.mul(C { re: pr, im: pi }).add(C { re: jump.b.re * scale, im: jump.b.im * scale });
+                let q = jump.a.mul(C { re: qr, im: qi });
+                (dr, di, pr, pi, qr, qi) = (d.re, d.im, p.re, p.im, q.re, q.im);
+                m += len; n += len; js += 1;
+            } else {
+                let npr = 2.0 * (fr * pr - fi * pi) + scale;
+                pi = 2.0 * (fr * pi + fi * pr); pr = npr;
+                if n > 0 { let nqr = 2.0 * (fr * qr - fi * qi); qi = 2.0 * (fr * qi + fi * qr); qr = nqr; }
+                let (zr, zi) = orbit[m];
+                let ndr = 2.0 * (zr * dr - zi * di) + (dr * dr - di * di) + dcr;
+                let ndi = 2.0 * (zr * di + zi * dr) + 2.0 * dr * di + dci;
+                dr = ndr; di = ndi; m += 1; n += 1; steps += 1;
+            }
+            if qr * qr + qi * qi < 1e-12 { return (Fate::Inside, steps, js); }
+            let (zr, zi) = orbit[m];
+            fr = zr + dr; fi = zi + di;
+            let mag = fr * fr + fi * fi;
+            if mag > BAILOUT { return (Fate::Escaped { n: n - 1, mag, de: 0.0 }, steps, js); }
+            if mag < dr * dr + di * di || m == last { dr = fr; di = fi; m = 0; }
+        }
+        (Fate::Unknown, steps, js)
+    }
+
+    #[test]
+    #[ignore]
+    fn what_raises_decide() {
+        let v = jump_tests_view(START_SCALE / 1e6);
+        let dc_max = (v.width as f64).hypot(v.height as f64) / 2.0 * v.scale;
+        let mut max_iter = v.max_iter();
+        let orbit = reference_orbit(&v, max_iter, &|| false).unwrap();
+        let jumps = Jumps::build(&orbit, dc_max, JUMP_EPS);
+        let mut pass = first_pass(&v, &orbit, &jumps, Level::new(), max_iter, 1, &|| false).unwrap();
+        while max_iter < 921_600 {
+            let before: Vec<usize> = pass.undecided.clone();
+            max_iter *= 2;
+            let orbit = reference_orbit(&v, max_iter, &|| false).unwrap();
+            let jumps = Jumps::build(&orbit, dc_max, JUMP_EPS);
+            let t = Instant::now();
+            continue_pass(&mut pass, &v, &orbit, &jumps, Level::new(), max_iter, &|| false);
+            let (mut inside, mut escaped) = (0, 0);
+            for i in before {
+                match pass.fates[i] { Fate::Inside => inside += 1, Fate::Escaped { .. } => escaped += 1, _ => {} }
+            }
+            eprintln!("to {max_iter:>7}: {:.2}s, {inside:>5} proven inside, {escaped:>5} escaped, {:>5} still undecided", t.elapsed().as_secs_f64(), pass.undecided.len());
+        }
+    }
+
+    fn jump_tests_view(scale: f64) -> View {
+        let prec = precision_for(scale);
+        let parse = |s: &str| {
+            use std::str::FromStr;
+            dashu_float::DBig::from_str(s).unwrap().with_base_and_precision::<2>(prec).value().with_rounding()
+        };
+        View { re: parse("-0.743643887037158704752191506114774"), im: parse("0.131825904205311970493132056385139"), scale, width: WIDTH, height: HEIGHT, iter_factor: 1.0, iter_floor: 0 }
+    }
+
+    #[test]
+    #[ignore]
+    fn where_time_goes() {
+        let parse = |s: &str, prec| {
+            use std::str::FromStr;
+            dashu_float::DBig::from_str(s).unwrap().with_base_and_precision::<2>(prec).value().with_rounding()
+        };
+        let sea = ("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139");
+        for (name, re, im, scale) in [
+            ("home", "-0.6", "0", 3.2 / WIDTH as f64),
+            ("1e3 seahorse", sea.0, sea.1, START_SCALE / 1e3),
+            ("1e6 seahorse", sea.0, sea.1, START_SCALE / 1e6),
+            ("1e14 seahorse", sea.0, sea.1, START_SCALE / 1e14),
+            ("5e28 minibrot", jump_tests::MINIBROT.0, jump_tests::MINIBROT.1, START_SCALE / 5e28),
+            ("5e31 minibrot", jump_tests::MINIBROT.0, jump_tests::MINIBROT.1, START_SCALE / 5e31),
+        ] {
+            let prec = precision_for(scale);
+            let view = View { re: parse(re, prec), im: parse(im, prec), scale, width: WIDTH, height: HEIGHT, iter_factor: 1.0, iter_floor: 0 };
+            // The app's own pipeline, end to end.
+            let (tx, rx) = channel();
+            let t = Instant::now();
+            render(view.clone(), 1, Arc::new(AtomicU64::new(1)), tx, || {});
+            let total = t.elapsed().as_secs_f64();
+            let frames: Vec<Frame> = rx.try_iter().collect();
+            if let Ok(dir) = std::env::var("SNAP_DIR") {
+                let f = frames.last().unwrap();
+                let mut ppm = format!("P6 {} {} 255\n", f.width, f.height).into_bytes();
+                ppm.extend(f.pixels.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8]));
+                std::fs::write(format!("{dir}/{}.ppm", name.replace(' ', "_")), ppm).unwrap();
+            }
+            let max_iter = frames.last().unwrap().max_iter;
+            let passes: Vec<String> = frames.iter().map(|f| format!("{}@{:.2}s:{}", f.max_iter, f.seconds, f.pixels.iter().filter(|&&p| p != 0).count())).collect();
+
+            let t = Instant::now();
+            let orbit = reference_orbit(&view, max_iter, &|| false).unwrap();
+            let t_orbit = t.elapsed().as_secs_f64();
+            let dc_max = (view.width as f64).hypot(view.height as f64) / 2.0 * view.scale;
+            let t = Instant::now();
+            let jumps = Jumps::build(&orbit, dc_max, JUMP_EPS);
+            let t_jumps = t.elapsed().as_secs_f64();
+
+            // Work per kind of pixel at the final limit: [count, plain steps, jumps].
+            let stats = (0..WIDTH * HEIGHT)
+                .into_par_iter()
+                .map(|i| {
+                    let (dcr, dci) = view.offset((i % WIDTH) as f64 + 0.5, (i / WIDTH) as f64 + 0.5);
+                    let (fate, s, j) = counted(&orbit, &jumps, dcr, dci, max_iter, view.scale);
+                    let k = match fate { Fate::Escaped { .. } => 0, Fate::Inside => 1, Fate::Unknown => 2 };
+                    let mut a = [[0u64; 3]; 3];
+                    a[k] = [1, s as u64, j as u64];
+                    a
+                })
+                .reduce(|| [[0u64; 3]; 3], |mut a, b| { for k in 0..3 { for x in 0..3 { a[k][x] += b[k][x]; } } a });
+            let work: u64 = stats.iter().map(|s| s[1] + s[2]).sum();
+            // Boundary fill: interior pixels whose 8 neighbours are all inside need no work.
+            let px: Vec<(Fate, u64)> = (0..WIDTH * HEIGHT).into_par_iter().map(|i| {
+                let (dcr, dci) = view.offset((i % WIDTH) as f64 + 0.5, (i / WIDTH) as f64 + 0.5);
+                let (f, s, j) = counted(&orbit, &jumps, dcr, dci, max_iter, view.scale);
+                (f, (s + j) as u64)
+            }).collect();
+            let inner = |i: usize| {
+                let (x, y) = ((i % WIDTH) as i64, (i / WIDTH) as i64);
+                (-1..=1).all(|dy| (-1..=1).all(|dx| {
+                    let (nx, ny) = (x + dx, y + dy);
+                    nx >= 0 && ny >= 0 && nx < WIDTH as i64 && ny < HEIGHT as i64 && px[(ny as usize) * WIDTH + nx as usize].0 == Fate::Inside
+                }))
+            };
+            let skippable: u64 = (0..px.len()).filter(|&i| inner(i)).map(|i| px[i].1).sum();
+            eprintln!("  boundary fill could skip {:.1}% of the final pass's work", 100.0 * skippable as f64 / work as f64);
+            eprintln!("\n{name}: app total {total:.2}s, passes {passes:?}, orbit {} its {t_orbit:.3}s, jumps build {t_jumps:.3}s", orbit.len());
+            for (k, label) in ["escaped", "inside", "undecided"].iter().enumerate() {
+                let [c, s, j] = stats[k];
+                eprintln!("  {label:>9}: {:5.1}% of pixels, {:5.1}% of work, avg {:.0} steps + {:.0} jumps",
+                    100.0 * c as f64 / (WIDTH * HEIGHT) as f64, 100.0 * (s + j) as f64 / work as f64,
+                    s as f64 / c.max(1) as f64, j as f64 / c.max(1) as f64);
+            }
         }
     }
 }
